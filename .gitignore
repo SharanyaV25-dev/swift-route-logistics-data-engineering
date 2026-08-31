@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated synthetic data
+Synthetic_Generated_Table_Data/
+Synthetic_Messy_Table_Data/
+
+# Local metadata/output
+Metadata/
+
+# Environment/secrets
+.env
+*.pem
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
