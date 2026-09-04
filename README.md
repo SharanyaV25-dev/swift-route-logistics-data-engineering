@@ -132,8 +132,8 @@ Generated bulk CSV/Parquet data should not be committed to GitHub. The repositor
 - [x] Purposeful messiness injection
 - [x] Local Bronze ingestion
 - [x] Bronze Git commit
-- [ ] Local Silver transformation
-- [ ] Silver validation
+- [x] Local Silver transformation
+- [x] Silver validation
 - [ ] Gold business marts
 - [ ] AWS S3 deployment
 - [ ] AWS Glue processing
