@@ -8,8 +8,12 @@ venv/
 Synthetic_Generated_Table_Data/
 Synthetic_Messy_Table_Data/
 
+# Project generated data
+data/
+
 # Local metadata/output
 Metadata/
+docs/gold_quality_report.csv/
 
 # Environment/secrets
 .env
