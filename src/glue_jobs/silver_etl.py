@@ -9,7 +9,7 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-
+# trigger CI/CD
 # 1. Initialize Spark with AWS Glue Iceberg Extensions
 spark = SparkSession.builder \
     .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
