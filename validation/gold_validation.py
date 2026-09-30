@@ -116,19 +116,12 @@ for table_name, primary_key in gold_tables.items():
     # Overall status
     # --------------------------------------------------------
 
-    status = "PASS"
-
-    if row_count == 0:
+    if row_count == 0 or null_key_count > 0 or duplicate_key_count > 0:
         status = "FAIL"
-
-    if null_key_count > 0:
-        status = "FAIL"
-
-    if duplicate_key_count > 0:
-        status = "FAIL"
-
-    if negative_numeric_count > 0:
+    elif negative_numeric_count > 0:
         status = "WARNING"
+    else:
+        status = "PASS"
 
     validation_results.append({
         "table_name": table_name,

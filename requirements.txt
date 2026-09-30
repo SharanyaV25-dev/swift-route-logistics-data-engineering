@@ -1,0 +1,6 @@
+pyspark==3.5.0
+pandas==2.1.1
+numpy==1.26.0
+sdv==1.8.0
+boto3==1.28.60
+pytest==7.4.2

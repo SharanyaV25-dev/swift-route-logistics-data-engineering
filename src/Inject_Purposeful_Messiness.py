@@ -1,28 +1,30 @@
 import os
 import random
 import pandas as pd
+from pathlib import Path
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = r"D:\Interview_Preparation_FinalG\VS Codes\SourceTables"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-INPUT_DIR = os.path.join(
-    BASE_DIR,
-    "Synthetic_Generated_Table_Data"
-)
+# Read from the clean directory we just generated
+INPUT_DIR = str(PROJECT_ROOT / "data" / "raw" / "clean")
 
-OUTPUT_DIR = os.path.join(
-    BASE_DIR,
-    "Synthetic_Messy_Table_Data"
-)
+# Write directly to the messy directory for Bronze ingestion
+OUTPUT_DIR = str(PROJECT_ROOT / "data" / "raw" / "messy")
 
-AUDIT_FILE = os.path.join(
-    OUTPUT_DIR,
-    "messiness_audit.csv"
-)
+# Store the audit report in the docs folder
+AUDIT_FILE = str(PROJECT_ROOT / "docs" / "messiness_audit.csv")
+
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+
+# Create the output directory automatically if it doesn't exist
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(AUDIT_FILE), exist_ok=True)
 
 RANDOM_SEED = 42
 
@@ -72,10 +74,10 @@ tables = {}
 
 for filename in os.listdir(INPUT_DIR):
 
-    if filename.endswith("_synthetic.csv"):
+    if filename.endswith(".csv"):
 
         table_name = filename.replace(
-            "_synthetic.csv",
+            ".csv",
             ""
         )
 
@@ -365,7 +367,7 @@ for table_name, df in tables.items():
 
     output_file = os.path.join(
         OUTPUT_DIR,
-        f"{table_name}_messy.csv"
+        f"{table_name}.csv"
     )
 
     df.to_csv(

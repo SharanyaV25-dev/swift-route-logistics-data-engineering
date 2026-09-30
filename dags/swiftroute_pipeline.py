@@ -29,7 +29,7 @@ with DAG(
     run_gold_job = GlueJobOperator(
         task_id='gold_etl',
         job_name='swiftroute-silver-to-gold-etl',
-        iam_role_name='YOUR_GLUE_IAM_ROLE_NAME', 
+        iam_role_name='AWSGlueServiceRole-SwiftRoute', 
         script_location='s3://swiftroute-logistics-de-bucket/scripts/gold_etl.py',
         aws_conn_id='aws_default',
         region_name='us-east-1',

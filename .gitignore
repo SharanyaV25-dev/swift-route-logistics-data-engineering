@@ -25,3 +25,12 @@ docs/gold_quality_report.csv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Ignore all data files
+data/**/*.csv
+data/**/*.parquet
+docs/metadata/*.json
+docs/*.csv
+
+# Keep directory structures intact but empty
+!data/**/.gitkeep

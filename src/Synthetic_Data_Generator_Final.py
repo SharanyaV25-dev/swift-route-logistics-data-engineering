@@ -8,16 +8,20 @@ from sdv.metadata import Metadata
 from sdv.metadata import SingleTableMetadata
 from sdv.single_table import GaussianCopulaSynthesizer
 
+from pathlib import Path
+import os
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-SOURCE_DIR = r"D:\\Interview_Preparation_FinalG\\VS Codes\\SourceTables"
 
-OUTPUT_DIR = r"D:\\Interview_Preparation_FinalG\\VS Codes\\Synthetic_Generated_Table_Data"
+# Dynamically route to the project root based on this file's location
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-METADATA_DIR = r"D:\\Interview_Preparation_FinalG\\VS Codes\\Metadata"
-
+# Define new relative paths and cast to strings for os compatibility
+SOURCE_DIR = str(PROJECT_ROOT / "data" / "raw" / "source")
+OUTPUT_DIR = str(PROJECT_ROOT / "data" / "raw" / "clean")
+METADATA_DIR = str(PROJECT_ROOT / "docs" / "metadata")
 
 # Target number of records required for your project
 TARGET_ROWS = {
@@ -367,7 +371,7 @@ np.random.seed(SEED)
 # OUTPUT DIRECTORIES
 # ============================================================
 
-SYNTHETIC_DIR = os.path.join(SOURCE_DIR, "Synthetic_Generated_Table_Data")
+SYNTHETIC_DIR = OUTPUT_DIR
 
 os.makedirs(SYNTHETIC_DIR, exist_ok=True)
 
@@ -1495,7 +1499,7 @@ for table_name, df in synthetic.items():
 
     output_file = os.path.join(
         SYNTHETIC_DIR,
-        f"{table_name}_synthetic.csv"
+        f"{table_name}.csv"
     )
 
     df.to_csv(
