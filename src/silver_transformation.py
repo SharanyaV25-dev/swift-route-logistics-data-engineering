@@ -1,9 +1,19 @@
+import sys
+import csv
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
-import csv, shutil
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType, IntegerType, LongType, DoubleType
-from pyspark.sql.window import Window
+
+# Ensure Python can find rules.py in the same directory
+sys.path.append(str(Path(__file__).resolve().parent))
+from rules import (
+    clean_id, deduplicate_deterministic, get_orphans, keep_valid_fk, 
+    get_invalid_loads, get_valid_loads, get_invalid_trips, 
+    get_valid_trips, get_invalid_events, get_valid_events
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BRONZE_DIR = PROJECT_ROOT / 'data' / 'bronze'
@@ -30,22 +40,9 @@ def quarantine(df, table, reason):
        .withColumn('quarantined_at_utc',F.lit(datetime.now(timezone.utc).isoformat()))
        .write.mode('overwrite').parquet(str(out)))
 
-def deduplicate_deterministic(df, pk_col):
-    """Deterministically deduplicates by keeping the first row when ordered by all columns."""
-    w = Window.partitionBy(pk_col).orderBy(*[F.col(c).asc_nulls_last() for c in df.columns])
-    return df.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") == 1).drop("_rn")
-
-def clean_id(c): return F.when(F.trim(F.col(c))=='',None).otherwise(F.trim(F.col(c)))
 def cast(df, mapping):
     for c,t in mapping.items(): df=df.withColumn(c,F.col(c).cast(t))
     return df
-
-def keep_valid_fk(child, child_col, parent, parent_col, table, reason):
-    valid = parent.select(F.col(parent_col).alias('_valid_fk')).distinct()
-    bad = (child.join(valid, child[child_col]==F.col('_valid_fk'),'left')
-           .filter(F.col('_valid_fk').isNull()).drop('_valid_fk'))
-    quarantine(bad, table, reason)
-    return child.join(valid, child[child_col]==F.col('_valid_fk'),'inner').drop('_valid_fk')
 
 print('\n'+'='*70+'\nSWIFTROUTE - SILVER TRANSFORMATION\n'+'='*70)
 bronze={t:read_bronze(t) for t in TABLES}
@@ -96,62 +93,48 @@ trucks = deduplicate_deterministic(trucks.filter(F.col("truck_id").isNotNull()),
 
 # Loads
 loads = cast(bronze["loads"], {"weight_lbs": DoubleType(), "pieces": IntegerType(), "revenue": DoubleType()}) \
-        .withColumn("load_id", clean_id("load_id")) \
-        .withColumn("customer_id", clean_id("customer_id")) \
-        .withColumn("route_id", clean_id("route_id")) \
-        .withColumn("load_date", F.to_date("load_date"))
+    .withColumn("load_id", clean_id("load_id")) \
+    .withColumn("customer_id", clean_id("customer_id")) \
+    .withColumn("route_id", clean_id("route_id")) \
+    .withColumn("load_date", F.to_date("load_date"))
 
 quarantine(loads.filter(F.col("load_id").isNull()), "loads", "missing_primary_key")
 loads = deduplicate_deterministic(loads.filter(F.col("load_id").isNotNull()), "load_id")
 
-bad_loads = loads.filter(F.col("weight_lbs").isNull() | (F.col("weight_lbs") <= 0) | F.col("revenue").isNull() | (F.col("revenue") < 0))
-quarantine(bad_loads, "loads", "invalid_business_values")
-loads = loads.filter(F.col("weight_lbs").isNotNull() & (F.col("weight_lbs") > 0) & F.col("revenue").isNotNull() & (F.col("revenue") >= 0))
+quarantine(get_invalid_loads(loads), "loads", "invalid_business_values")
+loads = get_valid_loads(loads)
 
-loads = keep_valid_fk(loads, "customer_id", customers, "customer_id", "loads", "invalid_customer_fk")
-loads = keep_valid_fk(loads, "route_id", routes, "route_id", "loads", "invalid_route_fk")
-
+for fk_col, parent_df, reason in [("customer_id", customers, "invalid_customer_fk"), ("route_id", routes, "invalid_route_fk")]:
+    quarantine(get_orphans(loads, fk_col, parent_df, fk_col), "loads", reason)
+    loads = keep_valid_fk(loads, fk_col, parent_df, fk_col)
 
 # Trips
 trips = cast(bronze["trips"], {"actual_distance_miles": DoubleType(), "actual_duration_hours": DoubleType(), "fuel_gallons_used": DoubleType(), "idle_time_hours": DoubleType()}) \
-        .withColumn("trip_id", clean_id("trip_id")) \
-        .withColumn("load_id", clean_id("load_id")) \
-        .withColumn("driver_id", clean_id("driver_id")) \
-        .withColumn("truck_id", clean_id("truck_id")) \
-        .withColumn("dispatch_date", F.to_date("dispatch_date"))
+    .withColumn("trip_id", clean_id("trip_id")).withColumn("load_id", clean_id("load_id")).withColumn("driver_id", clean_id("driver_id")).withColumn("truck_id", clean_id("truck_id")).withColumn("dispatch_date", F.to_date("dispatch_date"))
 
 quarantine(trips.filter(F.col("trip_id").isNull()), "trips", "missing_primary_key")
 trips = deduplicate_deterministic(trips.filter(F.col("trip_id").isNotNull()), "trip_id")
 
-bad_metrics = trips.filter(F.col("actual_duration_hours").isNull() | F.col("idle_time_hours").isNull() | (F.col("actual_duration_hours") < 0) | (F.col("idle_time_hours") < 0) | (F.col("idle_time_hours") > F.col("actual_duration_hours")))
-quarantine(bad_metrics, "trips", "invalid_duration_metrics")
-trips = trips.filter(F.col("actual_duration_hours").isNotNull() & F.col("idle_time_hours").isNotNull() & (F.col("actual_duration_hours") >= 0) & (F.col("idle_time_hours") >= 0) & (F.col("idle_time_hours") <= F.col("actual_duration_hours")))
+quarantine(get_invalid_trips(trips), "trips", "invalid_duration_metrics")
+trips = get_valid_trips(trips)
 
-trips = keep_valid_fk(trips, "load_id", loads, "load_id", "trips", "invalid_load_fk")
-trips = keep_valid_fk(trips, "driver_id", drivers, "driver_id", "trips", "invalid_driver_fk")
-trips = keep_valid_fk(trips, "truck_id", trucks, "truck_id", "trips", "invalid_truck_fk")
-
+for fk_col, parent_df, reason in [("load_id", loads, "invalid_load_fk"), ("driver_id", drivers, "invalid_driver_fk"), ("truck_id", trucks, "invalid_truck_fk")]:
+    quarantine(get_orphans(trips, fk_col, parent_df, fk_col), "trips", reason)
+    trips = keep_valid_fk(trips, fk_col, parent_df, fk_col)
 
 # Delivery Events
 events = cast(bronze["delivery_events"], {"detention_minutes": IntegerType(), "on_time_flag": BooleanType()}) \
-         .withColumn("event_id", clean_id("event_id")) \
-         .withColumn("load_id", clean_id("load_id")) \
-         .withColumn("trip_id", clean_id("trip_id")) \
-         .withColumn("facility_id", clean_id("facility_id")) \
-         .withColumn("scheduled_datetime", F.to_timestamp("scheduled_datetime")) \
-         .withColumn("actual_datetime", F.to_timestamp("actual_datetime"))
+    .withColumn("event_id", clean_id("event_id")).withColumn("load_id", clean_id("load_id")).withColumn("trip_id", clean_id("trip_id")).withColumn("facility_id", clean_id("facility_id")).withColumn("scheduled_datetime", F.to_timestamp("scheduled_datetime")).withColumn("actual_datetime", F.to_timestamp("actual_datetime"))
 
 quarantine(events.filter(F.col("event_id").isNull()), "delivery_events", "missing_primary_key")
 events = deduplicate_deterministic(events.filter(F.col("event_id").isNotNull()), "event_id")
 
-bad_times = events.filter(F.col("scheduled_datetime").isNull() | F.col("actual_datetime").isNull() | (F.col("actual_datetime") < F.col("scheduled_datetime")))
-quarantine(bad_times, "delivery_events", "invalid_event_timestamps")
-events = events.filter(F.col("scheduled_datetime").isNotNull() & F.col("actual_datetime").isNotNull() & (F.col("actual_datetime") >= F.col("scheduled_datetime")))
+quarantine(get_invalid_events(events), "delivery_events", "invalid_event_timestamps")
+events = get_valid_events(events)
 
-events = keep_valid_fk(events, "load_id", loads, "load_id", "delivery_events", "orphan_load_fk")
-events = keep_valid_fk(events, "trip_id", trips, "trip_id", "delivery_events", "orphan_trip_fk")
-events = keep_valid_fk(events, "facility_id", facilities, "facility_id", "delivery_events", "invalid_facility_fk")
-
+for fk_col, parent_df, reason in [("load_id", loads, "orphan_load_fk"), ("trip_id", trips, "orphan_trip_fk"), ("facility_id", facilities, "invalid_facility_fk")]:
+    quarantine(get_orphans(events, fk_col, parent_df, fk_col), "delivery_events", reason)
+    events = keep_valid_fk(events, fk_col, parent_df, fk_col)
 
 silver={'customers':customers,'facilities':facilities,'routes':routes,'drivers':drivers,'trucks':trucks,'loads':loads,'trips':trips,'delivery_events':events}
 print('\n'+'='*70+'\nWRITING SILVER PARQUET\n'+'='*70)

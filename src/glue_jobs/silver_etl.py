@@ -4,13 +4,18 @@ from pyspark.context import SparkContext
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, IntegerType, BooleanType
-from pyspark.sql.window import Window
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
 
+# AWS Glue injects extra-py-files directly into the runtime path
+from rules import (
+    clean_id, deduplicate_deterministic, get_orphans, keep_valid_fk, 
+    get_invalid_loads, get_valid_loads, get_invalid_trips, 
+    get_valid_trips, get_invalid_events, get_valid_events
+)
+
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-# 1. Initialize Spark with AWS Glue Iceberg Extensions
 spark = SparkSession.builder \
     .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
     .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
@@ -28,10 +33,6 @@ BRONZE_BUCKET = "s3://swiftroute-logistics-de-bucket/bronze"
 QUARANTINE_BUCKET = "s3://swiftroute-logistics-de-bucket/silver/quarantine"
 DATABASE = "swiftroute_iceberg"
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
 def read_bronze(table):
     return spark.read.option("header", True).csv(f"{BRONZE_BUCKET}/{table}/*.csv")
 
@@ -46,26 +47,7 @@ def write_iceberg(df, table_name):
     df.writeTo(f"glue_catalog.{DATABASE}.{table_name}") \
       .tableProperty("format-version", "2") \
       .createOrReplace()
-
-def clean_id(c): 
-    return F.when(F.trim(F.col(c)) == '', None).otherwise(F.trim(F.col(c)))
-
-def keep_valid_fk(child_df, child_col, parent_df, parent_col, table_name, reason):
-    valid_keys = parent_df.select(F.col(parent_col).alias('_valid_fk')).distinct()
     
-    # Quarantine orphans
-    orphans = child_df.join(valid_keys, child_df[child_col] == F.col('_valid_fk'), "left") \
-                      .filter(F.col('_valid_fk').isNull()).drop('_valid_fk')
-    quarantine(orphans, table_name, reason)
-    
-    # Return valid records
-    return child_df.join(valid_keys, child_df[child_col] == F.col('_valid_fk'), "inner").drop('_valid_fk')
-
-def deduplicate_deterministic(df, pk_col):
-    """Deterministically retains the first row ordered by all columns."""
-    w = Window.partitionBy(pk_col).orderBy(*[F.col(c).asc_nulls_last() for c in df.columns])
-    return df.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") == 1).drop("_rn")
-
 # ============================================================
 # DIMENSIONS
 # ============================================================
@@ -119,95 +101,50 @@ write_iceberg(trucks, "trucks")
 
 # 6. Loads
 loads = read_bronze("loads")
-loads = loads.withColumn("weight_lbs", F.col("weight_lbs").cast(DoubleType())) \
-             .withColumn("revenue", F.col("revenue").cast(DoubleType())) \
-             .withColumn("load_id", clean_id("load_id")) \
-             .withColumn("customer_id", clean_id("customer_id")) \
-             .withColumn("route_id", clean_id("route_id"))
+loads = loads.withColumn("weight_lbs", F.col("weight_lbs").cast(DoubleType())).withColumn("revenue", F.col("revenue").cast(DoubleType())) \
+             .withColumn("load_id", clean_id("load_id")).withColumn("customer_id", clean_id("customer_id")).withColumn("route_id", clean_id("route_id"))
 
 quarantine(loads.filter(F.col("load_id").isNull()), "loads", "missing_primary_key")
 loads = deduplicate_deterministic(loads.filter(F.col("load_id").isNotNull()), "load_id")
 
-# Explicitly trap NULLs in quarantine so they do not silently vanish
-bad_loads = loads.filter(
-    F.col("weight_lbs").isNull() | (F.col("weight_lbs") <= 0) |
-    F.col("revenue").isNull() | (F.col("revenue") < 0)
-)
-quarantine(bad_loads, "loads", "invalid_business_values")
+quarantine(get_invalid_loads(loads), "loads", "invalid_business_values")
+loads = get_valid_loads(loads)
 
-loads = loads.filter(
-    F.col("weight_lbs").isNotNull() & (F.col("weight_lbs") > 0) &
-    F.col("revenue").isNotNull() & (F.col("revenue") >= 0)
-)
-
-loads = keep_valid_fk(loads, "customer_id", customers, "customer_id", "loads", "invalid_customer_fk")
-loads = keep_valid_fk(loads, "route_id", routes, "route_id", "loads", "invalid_route_fk")
+for fk_col, parent_df, reason in [("customer_id", customers, "invalid_customer_fk"), ("route_id", routes, "invalid_route_fk")]:
+    quarantine(get_orphans(loads, fk_col, parent_df, fk_col), "loads", reason)
+    loads = keep_valid_fk(loads, fk_col, parent_df, fk_col)
 write_iceberg(loads, "loads")
 
 # 7. Trips
 trips = read_bronze("trips")
-trips = trips.withColumn("actual_duration_hours", F.col("actual_duration_hours").cast(DoubleType())) \
-             .withColumn("idle_time_hours", F.col("idle_time_hours").cast(DoubleType())) \
-             .withColumn("trip_id", clean_id("trip_id")) \
-             .withColumn("load_id", clean_id("load_id")) \
-             .withColumn("driver_id", clean_id("driver_id")) \
-             .withColumn("truck_id", clean_id("truck_id"))
+trips = trips.withColumn("actual_duration_hours", F.col("actual_duration_hours").cast(DoubleType())).withColumn("idle_time_hours", F.col("idle_time_hours").cast(DoubleType())) \
+             .withColumn("trip_id", clean_id("trip_id")).withColumn("load_id", clean_id("load_id")).withColumn("driver_id", clean_id("driver_id")).withColumn("truck_id", clean_id("truck_id"))
 
 quarantine(trips.filter(F.col("trip_id").isNull()), "trips", "missing_primary_key")
 trips = deduplicate_deterministic(trips.filter(F.col("trip_id").isNotNull()), "trip_id")
 
-# Explicitly trap NULL duration and idle metrics
-bad_metrics = trips.filter(
-    F.col("actual_duration_hours").isNull() |
-    F.col("idle_time_hours").isNull() |
-    (F.col("actual_duration_hours") < 0) |
-    (F.col("idle_time_hours") < 0) |
-    (F.col("idle_time_hours") > F.col("actual_duration_hours"))
-)
-quarantine(bad_metrics, "trips", "invalid_duration_metrics")
+quarantine(get_invalid_trips(trips), "trips", "invalid_duration_metrics")
+trips = get_valid_trips(trips)
 
-trips = trips.filter(
-    F.col("actual_duration_hours").isNotNull() &
-    F.col("idle_time_hours").isNotNull() &
-    (F.col("actual_duration_hours") >= 0) &
-    (F.col("idle_time_hours") >= 0) &
-    (F.col("idle_time_hours") <= F.col("actual_duration_hours"))
-)
-
-trips = keep_valid_fk(trips, "load_id", loads, "load_id", "trips", "invalid_load_fk")
-trips = keep_valid_fk(trips, "driver_id", drivers, "driver_id", "trips", "invalid_driver_fk")
-trips = keep_valid_fk(trips, "truck_id", trucks, "truck_id", "trips", "invalid_truck_fk")
+for fk_col, parent_df, reason in [("load_id", loads, "invalid_load_fk"), ("driver_id", drivers, "invalid_driver_fk"), ("truck_id", trucks, "invalid_truck_fk")]:
+    quarantine(get_orphans(trips, fk_col, parent_df, fk_col), "trips", reason)
+    trips = keep_valid_fk(trips, fk_col, parent_df, fk_col)
 write_iceberg(trips, "trips")
 
 # 8. Delivery Events
 events = read_bronze("delivery_events")
-events = events.withColumn("scheduled_datetime", F.to_timestamp("scheduled_datetime")) \
-               .withColumn("actual_datetime", F.to_timestamp("actual_datetime")) \
-               .withColumn("event_id", clean_id("event_id")) \
-               .withColumn("load_id", clean_id("load_id")) \
-               .withColumn("trip_id", clean_id("trip_id")) \
-               .withColumn("facility_id", clean_id("facility_id"))
+events = events.withColumn("scheduled_datetime", F.to_timestamp("scheduled_datetime")).withColumn("actual_datetime", F.to_timestamp("actual_datetime")) \
+               .withColumn("event_id", clean_id("event_id")).withColumn("load_id", clean_id("load_id")).withColumn("trip_id", clean_id("trip_id")).withColumn("facility_id", clean_id("facility_id"))
 
 quarantine(events.filter(F.col("event_id").isNull()), "delivery_events", "missing_primary_key")
 events = deduplicate_deterministic(events.filter(F.col("event_id").isNotNull()), "event_id")
 
-# Explicitly trap NULL timestamps alongside temporal logic violations
-bad_times = events.filter(
-    F.col("scheduled_datetime").isNull() |
-    F.col("actual_datetime").isNull() |
-    (F.col("actual_datetime") < F.col("scheduled_datetime"))
-)
-quarantine(bad_times, "delivery_events", "invalid_event_timestamps")
+quarantine(get_invalid_events(events), "delivery_events", "invalid_event_timestamps")
+events = get_valid_events(events)
 
-events = events.filter(
-    F.col("scheduled_datetime").isNotNull() &
-    F.col("actual_datetime").isNotNull() &
-    (F.col("actual_datetime") >= F.col("scheduled_datetime"))
-)
-
-events = keep_valid_fk(events, "load_id", loads, "load_id", "delivery_events", "orphan_load_fk")
-events = keep_valid_fk(events, "trip_id", trips, "trip_id", "delivery_events", "orphan_trip_fk")
-events = keep_valid_fk(events, "facility_id", facilities, "facility_id", "delivery_events", "invalid_facility_fk")
+for fk_col, parent_df, reason in [("load_id", loads, "orphan_load_fk"), ("trip_id", trips, "orphan_trip_fk"), ("facility_id", facilities, "invalid_facility_fk")]:
+    quarantine(get_orphans(events, fk_col, parent_df, fk_col), "delivery_events", reason)
+    events = keep_valid_fk(events, fk_col, parent_df, fk_col)
 write_iceberg(events, "delivery_events")
 
 job.commit()
