@@ -1,130 +1,122 @@
 # SwiftRoute Logistics: Cloud Lakehouse & Automated Data Pipeline
 
-An end-to-end, production-grade cloud data engineering project simulating a high-throughput logistics operational platform. The pipeline ingests transactional operational data into an AWS-native Medallion Lakehouse using Apache Iceberg, enforces enterprise data quality with PySpark, orchestrates multi-stage ETL workflows with Apache Airflow, and automates continuous deployment via GitHub Actions.
+[![CI/CD Pipeline](https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering/actions/workflows/ci_cd_pipeline.yml/badge.svg)](https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering/actions)
+![Python](https://img.shields.io/badge/Python-3.10-blue?logo=python)
+![PySpark](https://img.shields.io/badge/Apache_Spark-PySpark-E25A1C?logo=apachespark)
+![Apache Iceberg](https://img.shields.io/badge/Lakehouse-Apache_Iceberg-blue)
+![AWS](https://img.shields.io/badge/AWS-S3_|_Glue_|_Athena-232F3E?logo=amazonwebservices)
+![Apache Airflow](https://img.shields.io/badge/Orchestration-Apache_Airflow-017CEE?logo=apacheairflow)
+![Testing](https://img.shields.io/badge/Testing-Pytest-0A9EDC?logo=pytest)
+
+An enterprise-grade cloud data engineering pipeline simulating a high-throughput logistics and fleet management platform. The lakehouse implements a **Medallion Architecture** using **AWS Glue (PySpark)** and **Apache Iceberg**, orchestrated via **Apache Airflow**, protected by **Pytest automated unit tests**, and continuously deployed through **GitHub Actions**.
 
 ---
 
-## Architecture
+## Architecture Overview
 
-### End-to-End Pipeline Flow
+```
+                      ┌────────────────────────┐
+                      │  Raw Logistics Data    │
+                      │  (Batch CSV Streams)   │
+                      └───────────┬────────────┘
+                                  │
+                                  ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ BRONZE ZONE (Amazon S3)                                                │
+│ • Immutable, raw source landed as ingested                             │
+│ • Isolated ingestion paths per operational domain entity              │
+└───────────────────────────────┬────────────────────────────────────────┘
+                                  │
+                                  ▼  [AWS Glue: PySpark Data Quality Engine]
+┌────────────────────────────────────────────────────────────────────────┐
+│ SILVER ZONE (Amazon S3 / Apache Iceberg)                               │
+│ • Deterministic window deduplication on primary keys                   │
+│ • Defensive NULL validation preventing silent data drops               │
+│ • Strict foreign key referential integrity checks                      │
+│ • Corrupted & orphan records partitioned into S3 Quarantine prefixes   │
+└───────────────────────────────┬────────────────────────────────────────┘
+                                  │
+                                  ▼  [AWS Glue: Aggregations & Analytical Marts]
+┌────────────────────────────────────────────────────────────────────────┐
+│ GOLD ZONE (Amazon S3 / Apache Iceberg Tables)                          │
+│ • Business dimensional models and operational performance marts        │
+│ • Driver productivity, detention minutes, and route SLA compliance     │
+│ • ACID transactions, time travel, and hidden partitioning via Iceberg  │
+└───────────────────────────────┬────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ SERVING & ANALYTICS                                                    │
+│ • Amazon Athena serverless SQL via AWS Glue Data Catalog               │
+│ • Operational BI KPIs and business SLA analytics                       │
+└────────────────────────────────────────────────────────────────────────┘
+```
 
-1. **Source & Bronze Layer:** Raw operational logistics events (loads, trips, delivery events, facilities, drivers) are ingested as immutable batch snapshots into Amazon S3 Bronze.
-2. **Silver Layer (Validation & Cleansing):** PySpark jobs running on AWS Glue extract raw data, enforce schema constraints, perform entity deduplication, validate foreign-key relationships, and quarantine corrupted records into dedicated S3 quarantine prefixes before writing clean datasets.
-3. **Gold Layer (Analytical Marts & Apache Iceberg):** Curated Silver datasets are aggregated into optimized analytical tables using the Apache Iceberg open table format on Amazon S3, enabling ACID transactions, time travel, and hidden partitioning.
-4. **Ad-Hoc & BI Serving:** Business queries and operational performance KPIs are served directly through Amazon Athena backed by the AWS Glue Data Catalog.
-5. **Orchestration:** Workflows are orchestrated end-to-end via an Apache Airflow DAG utilizing the `GlueJobOperator` to manage dependency resolution and task monitoring.
-6. **DataOps / CI/CD:** Automated GitHub Actions workflows deploy PySpark scripts and Airflow orchestration logic directly to S3 and runtime environments upon branch merge.
+---
+
+## Production Engineering Highlights
+
+* **DRY Modular Architecture:** Centralized business logic, schema sanitization, and filtering constraints into a single shared `rules.py` module. Both local PySpark runs and AWS Glue jobs import identical transformation rules, eliminating pipeline drift.
+* **Deterministic Deduplication:** Replaced non-deterministic `dropDuplicates()` with PySpark `Window.partitionBy(pk).orderBy(...)` row ranking. Ties across duplicate primary keys are broken deterministically by ordering across attribute columns.
+* **Elimination of Silent Data Loss:** Standardized three-valued boolean logic in PySpark filters. Null values are explicitly caught and segregated (`isNull() | (val <= 0)`), ensuring corrupted records are reliably tracked in quarantine audit partitions rather than vanishing during writes.
+* **Automated CI/CD Test Gating:** Configured GitHub Actions to initialize Java 11 runtime dependencies and run automated Pytest suites against transformation logic. AWS S3 deployments for Glue scripts and Airflow DAGs are strictly blocked if any transformation assertion fails.
+* **Idempotent Silver/Gold Writes:** Configured table writes with Apache Iceberg format version 2 and transactional table replacements, ensuring failed task restarts do not leave partial or corrupted states.
 
 ---
 
 ## Tech Stack
 
-| Domain | Technology | Purpose |
-| --- | --- | --- |
-| **Compute & Processing** | PySpark, AWS Glue (Serverless) | Distributed distributed data transformations, data cleaning, and aggregations |
+| Domain | Technology | Implementation Details |
+| :--- | :--- | :--- |
+| **Compute & Processing** | PySpark, AWS Glue (Serverless) | Distributed data transformations, schema validation, and aggregations |
 | **Storage & Lakehouse** | Amazon S3, Apache Iceberg | Scalable object storage with ACID transactional table formats |
 | **Catalog & Serving** | AWS Glue Data Catalog, Amazon Athena | Centralized metadata schema repository and serverless Presto/Trino SQL engine |
 | **Orchestration** | Apache Airflow, Docker | Code-first dependency management, scheduling, monitoring, and state alerts |
-| **DevOps & CI/CD** | GitHub Actions, Git | Automated deployment of pipeline code and DAG scripts to cloud targets |
+| **DevOps & CI/CD** | GitHub Actions, Git | Automated testing and deployment of pipeline code and DAG scripts to cloud targets |
+| **Testing** | Pytest, Local PySpark Fixture | Automated test suite validating deduplication rules, schema constraints, and edge cases |
 | **Security & Identity** | AWS IAM | Principle of least privilege authentication for GitHub deployers and Airflow workers |
 | **Language & Tooling** | Python 3.10+, SQL, Boto3 | Core script logic, data manipulation, and cloud SDK interaction |
 
 ---
 
-## Medallion Data Architecture
+## Data Quality & Defensive Engineering
 
-```
-                    ┌────────────────────────┐
-                    │ Raw Logistics Data     │
-                    │ (CSV / Ingestion API)  │
-                    └───────────┬────────────┘
-                                │
-                                ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ BRONZE ZONE (Amazon S3)                                                │
-│ • Raw, immutable source files preserved as received                     │
-│ • Ingestion metadata appended (ingest_timestamp, batch_id)             │
-└───────────────────────────────┬────────────────────────────────────────┘
-                                │
-                                ▼  [AWS Glue: PySpark Validation]
-┌────────────────────────────────────────────────────────────────────────┐
-│ SILVER ZONE (Amazon S3 - Parquet)                                      │
-│ • Type casting & null handling                                         │
-│ • Deduplication on primary business keys                               │
-│ • Business rule enforcement (positive weights, valid timestamps)       │
-│ • Malformed / orphan records routed to S3 Quarantine prefix            │
-└───────────────────────────────┬────────────────────────────────────────┘
-                                │
-                                ▼  [AWS Glue: Iceberg Transformations]
-┌────────────────────────────────────────────────────────────────────────┐
-│ GOLD ZONE (Amazon S3 - Apache Iceberg Tables)                          │
-│ • Dimensional models & business marts                                  │
-│ • Route reliability & facility detention performance metrics           │
-│ • On-time delivery SLA calculations                                    │
-│ • Partitioned for high-performance Amazon Athena SQL analytics         │
-└────────────────────────────────────────────────────────────────────────┘
+To mirror production real-world data issues, incoming records contain intentional edge cases handled at the transformation boundary:
 
-```
+| Entity | Edge Case | Mitigation & Routing Strategy |
+| :--- | :--- | :--- |
+| **Loads** | Duplicate `load_id` | Window function deduplication retaining deterministic survivor row |
+| **Loads** | Null or negative `weight_lbs` / `revenue` | Quarantined to `s3://.../quarantine/loads/invalid_business_values/` |
+| **Trips** | Missing parent `load_id` / `driver_id` | Quarantined to `s3://.../quarantine/trips/invalid_fk/` via left anti-join |
+| **Trips** | `idle_time_hours > actual_duration_hours` | Quarantined to `s3://.../quarantine/trips/invalid_duration_metrics/` |
+| **Delivery Events** | `actual_datetime < scheduled_datetime` | Temporal boundary check routed to `invalid_event_timestamps/` |
+| **All Dimensions** | Empty string primary keys (`""`) | Sanitized to native `NULL` and routed to `missing_primary_key/` |
 
 ---
 
-## Intentional Data Quality Engineering
+## CI/CD Pipeline Workflow
 
-To simulate production edge cases, the ingestion stream tests defensive data-engineering logic with deliberate defects handled at the Silver transformation layer:
+The repository uses GitHub Actions (`.github/workflows/ci_cd_pipeline.yml`) to enforce deployment quality:
 
-| Entity | Injected Issue | Pipeline Resolution Strategy |
-| --- | --- | --- |
-| `loads` | Duplicate Load IDs | Window function deduplication retaining latest ingestion timestamp |
-| `loads` | Missing Customer IDs / Null Keys | Rejection & logging into `quarantine/loads/missing_customer_id/` |
-| `loads` | Negative or Zero Weights | Filtered out via business rule assertion: `weight > 0` |
-| `trips` | Missing Driver IDs | Quarantined; prevented from orphan joins downstream |
-| `delivery_events` | Impossible Timestamps (`pickup_time > drop_time`) | Temporal boundary validation; routed to error catalog |
-| `delivery_events` | Duplicate Event Transactions | Distinct state tracking across event UUIDs |
-
----
-
-## Orchestration & Pipeline Management
-
-Orchestration is managed programmatically via **Apache Airflow** using the `swiftroute_medallion_pipeline` DAG:
-
-* **Task Decoupling:** Airflow delegates heavy compute to AWS Glue's serverless PySpark cluster via `GlueJobOperator`, maintaining a lightweight execution footprint.
-* **Deterministic Sequencing:** Upstream dependencies strictly block downstream execution (`run_silver_job >> run_gold_job`) ensuring business marts reflect fully validated source states.
-* **Idempotency & Restarts:** Task state tracking enables isolated retries of failed pipeline steps without re-running successfully ingested stages.
-
-```python
-# Core Airflow DAG Definition
-from airflow import DAG
-from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
-from datetime import datetime
-
-with DAG(
-    dag_id='swiftroute_medallion_pipeline',
-    start_date=datetime(2026, 1, 1),
-    schedule_interval=None,
-    catchup=False,
-    tags=['swiftroute', 'lakehouse', 'glue'],
-) as dag:
-
-    run_silver_job = GlueJobOperator(
-        task_id='silver_etl',
-        job_name='swiftroute-bronze-to-silver-etl',
-        script_location='s3://swiftroute-logistics-de-bucket/scripts/silver_etl.py',
-        aws_conn_id='aws_default',
-        region_name='us-east-1',
-        wait_for_completion=True
-    )
-
-    run_gold_job = GlueJobOperator(
-        task_id='gold_etl',
-        job_name='swiftroute-silver-to-gold-etl',
-        script_location='s3://swiftroute-logistics-de-bucket/scripts/gold_etl.py',
-        aws_conn_id='aws_default',
-        region_name='us-east-1',
-        wait_for_completion=True
-    )
-
-    run_silver_job >> run_gold_job
-
+```
+[ Git Push / PR ] 
+       │
+       ▼
+[ Job 1: Run Unit Tests ]
+  ├── Checkout Code
+  ├── Set up Java 11 (Temurin) & Python 3.10
+  ├── Install requirements.txt
+  └── Run Pytest Suite (tests/test_silver_rules.py)
+       │
+       ├─► (Fail) ──► Stop Pipeline & Block Deployment
+       ▼
+   (Pass)
+       │
+       ▼
+[ Job 2: Deploy to AWS S3 ]
+  ├── Authenticate AWS Credentials via IAM
+  ├── Sync src/glue_jobs/ to S3 Glue Script Bucket
+  └── Sync dags/ to S3 Airflow DAG Directory
 ```
 
 ---
@@ -135,30 +127,31 @@ with DAG(
 swift-route-logistics-data-engineering/
 ├── .github/
 │   └── workflows/
-│       └── deploy-to-s3.yml          # CI/CD deployment pipeline for Glue scripts
-├── assets/
-│   └── pipeline_architecture.png     # System architecture diagram
+│       └── ci_cd_pipeline.yml        # Gated CI/CD workflow (Pytest -> AWS S3 sync)
 ├── dags/
-│   └── swiftroute_pipeline.py        # Master Airflow orchestration DAG
+│   └── swiftroute_pipeline.py        # Master Airflow orchestration DAG (GlueJobOperator)
 ├── src/
-│   ├── bronze_ingestion.py           # Ingestion script to raw S3 zones
-│   ├── silver_transformation.py      # PySpark validation, deduplication, & quarantine logic
-│   └── gold_iceberg_marts.py         # PySpark aggregation into Apache Iceberg tables
-├── validation/
-│   └── data_quality_checks.py        # Schema enforcement & validation assertions
-├── docker-compose.yaml               # Airflow environment service definition
+│   ├── rules.py                      # Centralized PySpark transformation & quality rules
+│   ├── silver_transformation.py      # Local Silver processing pipeline
+│   ├── gold_iceberg_marts.py         # PySpark aggregation into Apache Iceberg analytical tables
+│   └── glue_jobs/
+│       ├── silver_etl.py             # Production AWS Glue job for Silver layer
+│       └── gold_etl.py               # Production AWS Glue job for Gold layer
+├── tests/
+│   ├── conftest.py                   # Session-scoped local PySpark test fixture
+│   └── test_silver_rules.py          # Unit tests for data cleaning & quarantine logic
+├── docker-compose.yaml               # Local Airflow deployment configuration
 ├── requirements.txt                  # Python dependencies
 └── README.md
-
 ```
 
 ---
 
 ## Analytical Serving Layer (Sample Business Queries)
 
-Once the pipeline processes data into the Gold Iceberg tables, analytics can be executed directly in **Amazon Athena**:
+Once curated into Gold Apache Iceberg tables, operational metrics are queryable via Amazon Athena:
 
-### 1. Delivery On-Time Performance (SLA Compliance)
+### 1. Route SLA & On-Time Performance Analysis
 
 ```sql
 SELECT 
@@ -167,62 +160,59 @@ SELECT
     ROUND(AVG(CASE WHEN is_delayed = 0 THEN 1.0 ELSE 0.0 END) * 100, 2) AS on_time_percentage,
     ROUND(AVG(delay_duration_minutes), 1) AS avg_delay_minutes
 FROM 
-    "glue_database"."gold_route_performance"
+    "swiftroute_iceberg"."gold_route_performance"
 GROUP BY 
     route_id
 HAVING 
-    COUNT(trip_id) >= 50
+    COUNT(trip_id) >= 25
 ORDER BY 
     on_time_percentage ASC;
-
 ```
 
-### 2. Facility Detention & Congestion Analysis
+### 2. Facility Congestion & Detention Bottlenecks
 
 ```sql
 SELECT 
     facility_id,
-    COUNT(event_id) AS total_checkins,
-    ROUND(AVG(detention_time_minutes), 2) AS avg_detention_minutes,
-    MAX(detention_time_minutes) AS peak_detention_minutes
+    COUNT(event_id) AS total_events,
+    ROUND(AVG(detention_minutes), 2) AS avg_detention_minutes,
+    MAX(detention_minutes) AS peak_detention_minutes
 FROM 
-    "glue_database"."gold_facility_performance"
+    "swiftroute_iceberg"."gold_facility_performance"
 GROUP BY 
     facility_id
 ORDER BY 
     avg_detention_minutes DESC
 LIMIT 10;
-
 ```
 
 ---
 
-## Running the Pipeline
+## Local Setup & Testing
 
-### Local / Cloud Orchestration Setup
+### 1. Clone & Configure Environment
 
-1. Clone the repository:
 ```bash
-git clone https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering.git
+git clone [https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering.git](https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering.git)
 cd swift-route-logistics-data-engineering
 
+python -m venv venv
+# On Windows:
+.\venv\Scripts\activate
+# On Linux/macOS:
+source venv/bin/activate
+
+pip install -r requirements.txt
 ```
 
+### 2. Run Automated PySpark Tests
 
-2. Launch Airflow locally or inside a Cloud Development Environment (CDE) using Docker:
 ```bash
-docker run -d -p 8080:8080 \
-  -v $(pwd)/dags:/opt/airflow/dags \
-  --name airflow apache/airflow:2.10.1 standalone
-
+python -m pytest tests/ -v
 ```
 
+### 3. Run Silver Pipeline Locally
 
-3. Retrieve the webserver password:
 ```bash
-docker exec airflow cat /opt/airflow/standalone_admin_password.txt
-
+python src/silver_transformation.py
 ```
-
-
-4. Access `http://localhost:8080`, configure the `aws_default` connection with scoped AWS credentials, unpause `swiftroute_medallion_pipeline`, and trigger the execution run.
