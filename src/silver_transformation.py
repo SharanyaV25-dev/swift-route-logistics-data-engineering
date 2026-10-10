@@ -99,10 +99,12 @@ loads = cast(bronze["loads"], {"weight_lbs": DoubleType(), "pieces": IntegerType
     .withColumn("load_date", F.to_date("load_date"))
 
 quarantine(loads.filter(F.col("load_id").isNull()), "loads", "missing_primary_key")
-loads = deduplicate_deterministic(loads.filter(F.col("load_id").isNotNull()), "load_id")
+loads = loads.filter(F.col("load_id").isNotNull())
 
 quarantine(get_invalid_loads(loads), "loads", "invalid_business_values")
 loads = get_valid_loads(loads)
+
+loads = deduplicate_deterministic(loads, "load_id")
 
 for fk_col, parent_df, reason in [("customer_id", customers, "invalid_customer_fk"), ("route_id", routes, "invalid_route_fk")]:
     quarantine(get_orphans(loads, fk_col, parent_df, fk_col), "loads", reason)
@@ -113,10 +115,12 @@ trips = cast(bronze["trips"], {"actual_distance_miles": DoubleType(), "actual_du
     .withColumn("trip_id", clean_id("trip_id")).withColumn("load_id", clean_id("load_id")).withColumn("driver_id", clean_id("driver_id")).withColumn("truck_id", clean_id("truck_id")).withColumn("dispatch_date", F.to_date("dispatch_date"))
 
 quarantine(trips.filter(F.col("trip_id").isNull()), "trips", "missing_primary_key")
-trips = deduplicate_deterministic(trips.filter(F.col("trip_id").isNotNull()), "trip_id")
+trips = trips.filter(F.col("trip_id").isNotNull())
 
 quarantine(get_invalid_trips(trips), "trips", "invalid_duration_metrics")
 trips = get_valid_trips(trips)
+
+trips = deduplicate_deterministic(trips, "trip_id")
 
 for fk_col, parent_df, reason in [("load_id", loads, "invalid_load_fk"), ("driver_id", drivers, "invalid_driver_fk"), ("truck_id", trucks, "invalid_truck_fk")]:
     quarantine(get_orphans(trips, fk_col, parent_df, fk_col), "trips", reason)
@@ -127,10 +131,12 @@ events = cast(bronze["delivery_events"], {"detention_minutes": IntegerType(), "o
     .withColumn("event_id", clean_id("event_id")).withColumn("load_id", clean_id("load_id")).withColumn("trip_id", clean_id("trip_id")).withColumn("facility_id", clean_id("facility_id")).withColumn("scheduled_datetime", F.to_timestamp("scheduled_datetime")).withColumn("actual_datetime", F.to_timestamp("actual_datetime"))
 
 quarantine(events.filter(F.col("event_id").isNull()), "delivery_events", "missing_primary_key")
-events = deduplicate_deterministic(events.filter(F.col("event_id").isNotNull()), "event_id")
+events = events.filter(F.col("event_id").isNotNull())
 
 quarantine(get_invalid_events(events), "delivery_events", "invalid_event_timestamps")
 events = get_valid_events(events)
+
+events = deduplicate_deterministic(events, "event_id")
 
 for fk_col, parent_df, reason in [("load_id", loads, "orphan_load_fk"), ("trip_id", trips, "orphan_trip_fk"), ("facility_id", facilities, "invalid_facility_fk")]:
     quarantine(get_orphans(events, fk_col, parent_df, fk_col), "delivery_events", reason)
