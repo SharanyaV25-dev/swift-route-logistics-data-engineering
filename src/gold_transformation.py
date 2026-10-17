@@ -1,6 +1,6 @@
 from pathlib import Path
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, concat_ws, count, sum as spark_sum, avg, round, when, lit
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col, concat_ws, count, sum as spark_sum, avg, round, when, lit, current_timestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SILVER_DIR = PROJECT_ROOT / "data" / "silver"
@@ -13,44 +13,62 @@ spark = (
 )
 
 
-def read_silver(table_name):
+def read_silver(table_name: str, primary_key: str = None) -> DataFrame:
+    """
+    Read Silver Parquet dataset and enforce idempotent grain deduplication
+    so duplicate upstream batch deliveries never multiply Gold metrics.
+    """
     path = SILVER_DIR / table_name
 
     if not path.exists():
         raise FileNotFoundError(f"Silver dataset not found: {path}")
 
-    return spark.read.parquet(str(path))
+    df = spark.read.parquet(str(path))
+
+    if primary_key and primary_key in df.columns:
+        df = df.dropDuplicates([primary_key])
+
+    return df
 
 
-def write_gold(df, table_name):
+def write_gold(df: DataFrame, table_name: str, primary_key: str = None):
+    """
+    Idempotently write Gold dataset with primary-key grain enforcement
+    and ingestion timestamp tracking.
+    """
     output_path = GOLD_DIR / table_name
 
+    if primary_key and primary_key in df.columns:
+        df = df.dropDuplicates([primary_key])
+
+    df_with_meta = df.withColumn("last_ingested_at", current_timestamp())
+
     (
-        df.write
+        df_with_meta.write
         .mode("overwrite")
         .parquet(str(output_path))
     )
 
-    print(f"PASS: {table_name:<30} {df.count():>8,} rows")
+    print(f"PASS: {table_name:<30} {df_with_meta.count():>8,} rows")
 
 
 GOLD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
-# READ SILVER TABLES
+# READ SILVER TABLES (WITH IDEMPOTENT GRAIN DEDUPLICATION)
 # ============================================================
 
-customers = read_silver("customers")
-facilities = read_silver("facilities")
-routes = read_silver("routes")
-drivers = read_silver("drivers")
-trucks = read_silver("trucks")
-loads = read_silver("loads")
-trips = read_silver("trips")
-delivery_events = read_silver("delivery_events")
+customers = read_silver("customers", primary_key="customer_id")
+facilities = read_silver("facilities", primary_key="facility_id")
+routes = read_silver("routes", primary_key="route_id")
+drivers = read_silver("drivers", primary_key="driver_id")
+trucks = read_silver("trucks", primary_key="truck_id")
+loads = read_silver("loads", primary_key="load_id")
+trips = read_silver("trips", primary_key="trip_id")
+delivery_events = read_silver("delivery_events", primary_key="event_id")
 
 print("=" * 70)
-print("CREATING GOLD LAYER")
+print("CREATING GOLD LAYER (IDEMPOTENT EXECUTION)")
 print("=" * 70)
 
 
@@ -102,7 +120,7 @@ load_performance = (
     )
 )
 
-write_gold(load_performance, "gold_load_performance")
+write_gold(load_performance, "gold_load_performance", primary_key="load_id")
 
 # ============================================================
 # 2. GOLD DELIVERY PERFORMANCE
@@ -160,7 +178,7 @@ delivery_performance = (
     )
 )
 
-write_gold(delivery_performance, "gold_delivery_performance")
+write_gold(delivery_performance, "gold_delivery_performance", primary_key="event_id")
 
 # ============================================================
 # 3. GOLD DRIVER PERFORMANCE
@@ -214,7 +232,7 @@ driver_performance = (
     )
 )
 
-write_gold(driver_performance, "gold_driver_performance")
+write_gold(driver_performance, "gold_driver_performance", primary_key="driver_id")
 
 # ============================================================
 # 4. GOLD TRUCK / FUEL PERFORMANCE
@@ -275,7 +293,7 @@ truck_performance = (
     )
 )
 
-write_gold(truck_performance, "gold_truck_performance")
+write_gold(truck_performance, "gold_truck_performance", primary_key="truck_id")
 
 # ============================================================
 # 5. GOLD FACILITY PERFORMANCE
@@ -320,9 +338,9 @@ facility_performance = (
     )
 )
 
-write_gold(facility_performance, "gold_facility_performance")
+write_gold(facility_performance, "gold_facility_performance", primary_key="facility_id")
 
-## ============================================================
+# ============================================================
 # 6. GOLD ROUTE PERFORMANCE
 # ============================================================
 
@@ -383,7 +401,7 @@ route_performance = (
     )
 )
 
-write_gold(route_performance, "gold_route_performance")
+write_gold(route_performance, "gold_route_performance", primary_key="route_id")
 
 # ============================================================
 # 7. GOLD CUSTOMER PERFORMANCE
@@ -428,7 +446,7 @@ customer_performance = (
     )
 )
 
-write_gold(customer_performance, "gold_customer_performance")
+write_gold(customer_performance, "gold_customer_performance", primary_key="customer_id")
 
 # ============================================================
 # 8. GOLD DAILY OPERATIONS SUMMARY
@@ -463,45 +481,73 @@ daily_operations = (
     .orderBy("event_date")
 )
 
-write_gold(daily_operations, "gold_daily_operations")
+write_gold(daily_operations, "gold_daily_operations", primary_key="event_date")
 
 # ============================================================
-# FINAL VALIDATION
+# FINAL VALIDATION & GRAIN / CONTROL TOTAL RECONCILIATION
 # ============================================================
 
-gold_tables = [
-    "gold_load_performance",
-    "gold_delivery_performance",
-    "gold_driver_performance",
-    "gold_truck_performance",
-    "gold_facility_performance",
-    "gold_route_performance",
-    "gold_customer_performance",
-    "gold_daily_operations"
-]
+gold_table_keys = {
+    "gold_load_performance": "load_id",
+    "gold_delivery_performance": "event_id",
+    "gold_driver_performance": "driver_id",
+    "gold_truck_performance": "truck_id",
+    "gold_facility_performance": "facility_id",
+    "gold_route_performance": "route_id",
+    "gold_customer_performance": "customer_id",
+    "gold_daily_operations": "event_date",
+}
 
 print()
 print("=" * 70)
-print("GOLD VALIDATION")
+print("GOLD VALIDATION & IDEMPOTENCY GRAIN CHECK")
 print("=" * 70)
 
-for table_name in gold_tables:
+for table_name, pk in gold_table_keys.items():
     path = GOLD_DIR / table_name
     df = spark.read.parquet(str(path))
 
     row_count = df.count()
+    distinct_pk_count = df.select(pk).distinct().count()
     column_count = len(df.columns)
 
     if row_count == 0:
         raise ValueError(f"FAIL: {table_name} contains zero rows")
 
+    if row_count != distinct_pk_count:
+        raise ValueError(
+            f"FAIL: Duplicate primary keys detected in {table_name}! "
+            f"rows={row_count}, distinct({pk})={distinct_pk_count}"
+        )
+
     print(
         f"PASS: {table_name:<30} "
         f"rows={row_count:>8,} "
+        f"distinct_pk={distinct_pk_count:>8,} "
         f"columns={column_count}"
     )
 
-print()
+# Control Total Reconciliation: Silver Loads Revenue vs Gold Mart Revenue
+silver_total_rev = loads.agg(round(spark_sum("revenue"), 2)).collect()[0][0]
+gold_load_rev = (
+    spark.read.parquet(str(GOLD_DIR / "gold_load_performance"))
+    .agg(round(spark_sum("revenue"), 2))
+    .collect()[0][0]
+)
+gold_cust_rev = (
+    spark.read.parquet(str(GOLD_DIR / "gold_customer_performance"))
+    .agg(round(spark_sum("total_revenue"), 2))
+    .collect()[0][0]
+)
+
+if abs(silver_total_rev - gold_load_rev) > 0.01 or abs(silver_total_rev - gold_cust_rev) > 0.01:
+    raise ValueError(
+        f"RECONCILIATION FAIL: Silver Revenue ({silver_total_rev}) != "
+        f"Gold Load Revenue ({gold_load_rev}) / Customer Revenue ({gold_cust_rev})"
+    )
+
+print("-" * 70)
+print(f"RECONCILIATION PASS: Control Total Revenue = ${silver_total_rev:,.2f}")
 print("=" * 70)
 print("GOLD TRANSFORMATION PASSED")
 print("=" * 70)

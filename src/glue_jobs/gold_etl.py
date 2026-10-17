@@ -1,7 +1,7 @@
 import sys
 from pyspark.context import SparkContext
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, count, sum as spark_sum, avg, round, when, lit, concat_ws
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col, count, sum as spark_sum, avg, round, when, lit, concat_ws, current_timestamp
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -23,25 +23,68 @@ job.init(args['JOB_NAME'], args)
 
 DATABASE = "swiftroute_iceberg"
 
-def read_silver(table_name):
-    """Read the cleaned Silver Iceberg table directly from the catalog."""
-    return spark.table(f"glue_catalog.{DATABASE}.{table_name}")
 
-def write_gold(df, table_name):
-    """Write aggregated Gold DataFrames as new Iceberg tables."""
-    df.writeTo(f"glue_catalog.{DATABASE}.{table_name}") \
-      .tableProperty("format-version", "2") \
-      .createOrReplace()
+def read_silver(table_name: str, primary_key: str = None) -> DataFrame:
+    """
+    Read cleaned Silver Iceberg table from Glue Catalog and enforce primary-key
+    grain deduplication to protect against duplicate upstream batch deliveries.
+    """
+    df = spark.table(f"glue_catalog.{DATABASE}.{table_name}")
+    if primary_key and primary_key in df.columns:
+        df = df.dropDuplicates([primary_key])
+    return df
 
-# Read all 8 Silver tables
-customers = read_silver("customers")
-facilities = read_silver("facilities")
-routes = read_silver("routes")
-drivers = read_silver("drivers")
-trucks = read_silver("trucks")
-loads = read_silver("loads")
-trips = read_silver("trips")
-delivery_events = read_silver("delivery_events")
+
+def write_gold(df: DataFrame, table_name: str, primary_key: str = None):
+    """
+    Idempotently write Gold Iceberg tables.
+    If the table already exists and a primary_key is supplied, execute an ACID
+    Iceberg MERGE INTO upsert so reruns never duplicate records. Otherwise,
+    atomically create or replace the Iceberg v2 table.
+    """
+    full_table_name = f"glue_catalog.{DATABASE}.{table_name}"
+    if primary_key and primary_key in df.columns:
+        df = df.dropDuplicates([primary_key])
+
+    df_with_meta = df.withColumn("last_ingested_at", current_timestamp())
+
+    table_exists = spark.catalog.tableExists(full_table_name)
+
+    if table_exists and primary_key:
+        staging_view = f"staged_{table_name}"
+        df_with_meta.createOrReplaceTempView(staging_view)
+
+        update_cols = [c for c in df_with_meta.columns if c != primary_key]
+        set_clause = ", ".join([f"target.{c} = source.{c}" for c in update_cols])
+        insert_cols = ", ".join(df_with_meta.columns)
+        insert_vals = ", ".join([f"source.{c}" for c in df_with_meta.columns])
+
+        merge_sql = f"""
+            MERGE INTO {full_table_name} AS target
+            USING {staging_view} AS source
+            ON target.{primary_key} = source.{primary_key}
+            WHEN MATCHED THEN
+                UPDATE SET {set_clause}
+            WHEN NOT MATCHED THEN
+                INSERT ({insert_cols})
+                VALUES ({insert_vals})
+        """
+        spark.sql(merge_sql)
+    else:
+        df_with_meta.writeTo(full_table_name) \
+            .tableProperty("format-version", "2") \
+            .createOrReplace()
+
+
+# Read all 8 Silver tables with primary-key grain protection
+customers = read_silver("customers", primary_key="customer_id")
+facilities = read_silver("facilities", primary_key="facility_id")
+routes = read_silver("routes", primary_key="route_id")
+drivers = read_silver("drivers", primary_key="driver_id")
+trucks = read_silver("trucks", primary_key="truck_id")
+loads = read_silver("loads", primary_key="load_id")
+trips = read_silver("trips", primary_key="trip_id")
+delivery_events = read_silver("delivery_events", primary_key="event_id")
 
 # 1. GOLD LOAD PERFORMANCE
 load_performance = (
@@ -50,7 +93,7 @@ load_performance = (
     .join(routes.select("route_id", "origin_city", "origin_state", "destination_city", "destination_state"), on="route_id", how="left")
     .select("load_id", "customer_id", "customer_name", "customer_type", "account_status", "route_id", "origin_city", "origin_state", "destination_city", "destination_state", "load_date", "load_type", "weight_lbs", "pieces", "revenue", "load_status", "booking_type")
 )
-write_gold(load_performance, "gold_load_performance")
+write_gold(load_performance, "gold_load_performance", primary_key="load_id")
 
 # 2. GOLD DELIVERY PERFORMANCE
 delivery_performance = (
@@ -60,7 +103,7 @@ delivery_performance = (
     .join(facilities.select(col("facility_id"), "facility_name", "facility_type"), on="facility_id", how="left")
     .select("event_id", "load_id", "trip_id", "customer_id", "driver_id", "truck_id", "event_type", "facility_id", "facility_name", "facility_type", "location_city", "location_state", "scheduled_datetime", "actual_datetime", "detention_minutes", "on_time_flag", "revenue", "trip_status")
 )
-write_gold(delivery_performance, "gold_delivery_performance")
+write_gold(delivery_performance, "gold_delivery_performance", primary_key="event_id")
 
 # 3. GOLD DRIVER PERFORMANCE
 driver_performance = (
@@ -80,7 +123,7 @@ driver_performance = (
     .withColumn("fuel_efficiency_miles_per_gallon", round(col("total_distance_miles") / col("total_fuel_gallons"), 2))
     .select("driver_id", "driver_name", "employment_status", "years_experience", "total_trips", "total_distance_miles", "avg_distance_miles", "avg_duration_hours", "total_fuel_gallons", "avg_fuel_gallons", "fuel_efficiency_miles_per_gallon", "total_idle_time_hours", "avg_idle_time_hours")
 )
-write_gold(driver_performance, "gold_driver_performance")
+write_gold(driver_performance, "gold_driver_performance", primary_key="driver_id")
 
 # 4. GOLD TRUCK PERFORMANCE
 truck_performance = (
@@ -99,7 +142,7 @@ truck_performance = (
     .withColumn("fuel_efficiency_miles_per_gallon", when(col("total_fuel_gallons") > 0, round(col("total_distance_miles") / col("total_fuel_gallons"), 2)).otherwise(lit(0)))
     .select("truck_id", "unit_number", "make", "model_year", "fuel_type", "tank_capacity_gallons", "status", "total_trips", "total_distance_miles", "avg_distance_miles", "total_fuel_gallons", "avg_fuel_per_trip_gallons", "fuel_efficiency_miles_per_gallon", "total_idle_time_hours", "avg_idle_time_hours")
 )
-write_gold(truck_performance, "gold_truck_performance")
+write_gold(truck_performance, "gold_truck_performance", primary_key="truck_id")
 
 # 5. GOLD FACILITY PERFORMANCE
 facility_performance = (
@@ -114,7 +157,7 @@ facility_performance = (
     .withColumn("on_time_rate", round(col("on_time_events") / col("total_events") * 100, 2))
     .select("facility_id", "facility_name", "city", "state", "total_events", "on_time_events", "on_time_rate", "avg_detention_minutes")
 )
-write_gold(facility_performance, "gold_facility_performance")
+write_gold(facility_performance, "gold_facility_performance", primary_key="facility_id")
 
 # 6. GOLD ROUTE PERFORMANCE
 route_performance = (
@@ -131,7 +174,7 @@ route_performance = (
     .withColumn("fuel_efficiency_miles_per_gallon", round(col("avg_actual_distance_miles") / col("avg_fuel_consumed_gallons"), 2))
     .select("route_id", "origin_city", "origin_state", "destination_city", "destination_state", "typical_distance_miles", "typical_transit_days", "total_trips", "avg_trip_duration_hours", "avg_actual_distance_miles", "avg_fuel_consumed_gallons", "fuel_efficiency_miles_per_gallon")
 )
-write_gold(route_performance, "gold_route_performance")
+write_gold(route_performance, "gold_route_performance", primary_key="route_id")
 
 # 7. GOLD CUSTOMER PERFORMANCE
 customer_performance = (
@@ -147,7 +190,7 @@ customer_performance = (
     .withColumn("avg_revenue_per_load", round(col("total_revenue") / col("total_loads"), 2))
     .select("customer_id", "customer_name", "customer_type", "account_status", "total_loads", "total_revenue", "avg_revenue_per_load", "avg_load_weight_lbs", "total_pieces")
 )
-write_gold(customer_performance, "gold_customer_performance")
+write_gold(customer_performance, "gold_customer_performance", primary_key="customer_id")
 
 # 8. GOLD DAILY OPERATIONS
 daily_operations = (
@@ -162,6 +205,6 @@ daily_operations = (
     .select("event_date", "total_events", "on_time_events", "on_time_rate", "avg_detention_minutes")
     .orderBy("event_date")
 )
-write_gold(daily_operations, "gold_daily_operations")
+write_gold(daily_operations, "gold_daily_operations", primary_key="event_date")
 
 job.commit()
