@@ -1,7 +1,7 @@
 import sys
 from pyspark.context import SparkContext
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, count, sum as spark_sum, avg, round, when, lit, concat_ws, current_timestamp
+from pyspark.sql.functions import col, count, sum as spark_sum, avg, round, when, lit, concat_ws, current_timestamp, coalesce
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -86,12 +86,26 @@ loads = read_silver("loads", primary_key="load_id")
 trips = read_silver("trips", primary_key="trip_id")
 delivery_events = read_silver("delivery_events", primary_key="event_id")
 
-# 1. GOLD LOAD PERFORMANCE
+# 1. GOLD LOAD PERFORMANCE (PRE-AGGREGATED CHILD TABLES -> ZERO FAN-OUT)
+events_by_load = (
+    delivery_events
+    .groupBy("load_id")
+    .agg(
+        count("*").alias("total_delivery_events"),
+        spark_sum(when(col("on_time_flag") == True, 1).otherwise(0)).alias("on_time_events"),
+        round(spark_sum("detention_minutes"), 2).alias("total_detention_minutes")
+    )
+)
+
 load_performance = (
     loads
     .join(customers.select("customer_id", "customer_name", "customer_type", "account_status"), on="customer_id", how="left")
     .join(routes.select("route_id", "origin_city", "origin_state", "destination_city", "destination_state"), on="route_id", how="left")
-    .select("load_id", "customer_id", "customer_name", "customer_type", "account_status", "route_id", "origin_city", "origin_state", "destination_city", "destination_state", "load_date", "load_type", "weight_lbs", "pieces", "revenue", "load_status", "booking_type")
+    .join(events_by_load, on="load_id", how="left")
+    .withColumn("total_delivery_events", coalesce(col("total_delivery_events"), lit(0)))
+    .withColumn("on_time_events", coalesce(col("on_time_events"), lit(0)))
+    .withColumn("total_detention_minutes", coalesce(col("total_detention_minutes"), lit(0.0)))
+    .select("load_id", "customer_id", "customer_name", "customer_type", "account_status", "route_id", "origin_city", "origin_state", "destination_city", "destination_state", "load_date", "load_type", "weight_lbs", "pieces", "revenue", "load_status", "booking_type", "total_delivery_events", "on_time_events", "total_detention_minutes")
 )
 write_gold(load_performance, "gold_load_performance", primary_key="load_id")
 

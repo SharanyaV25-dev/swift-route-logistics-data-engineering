@@ -1,6 +1,6 @@
 from pathlib import Path
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, concat_ws, count, sum as spark_sum, avg, round, when, lit, current_timestamp
+from pyspark.sql.functions import col, concat_ws, count, sum as spark_sum, avg, round, when, lit, current_timestamp, coalesce
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SILVER_DIR = PROJECT_ROOT / "data" / "silver"
@@ -68,13 +68,25 @@ trips = read_silver("trips", primary_key="trip_id")
 delivery_events = read_silver("delivery_events", primary_key="event_id")
 
 print("=" * 70)
-print("CREATING GOLD LAYER (IDEMPOTENT EXECUTION)")
+print("CREATING GOLD LAYER (IDEMPOTENT & FAN-OUT SAFE EXECUTION)")
 print("=" * 70)
 
 
 # ============================================================
-# 1. GOLD LOAD PERFORMANCE
+# 1. GOLD LOAD PERFORMANCE (PRE-AGGREGATED CHILD TABLES -> ZERO FAN-OUT)
 # ============================================================
+
+# Pre-aggregate child delivery_events (250k rows) to parent load_id grain (50k rows)
+# BEFORE joining to loads so multi-event loads never multiply load revenue.
+events_by_load = (
+    delivery_events
+    .groupBy("load_id")
+    .agg(
+        count("*").alias("total_delivery_events"),
+        spark_sum(when(col("on_time_flag") == True, 1).otherwise(0)).alias("on_time_events"),
+        round(spark_sum("detention_minutes"), 2).alias("total_detention_minutes")
+    )
+)
 
 load_performance = (
     loads
@@ -99,6 +111,14 @@ load_performance = (
         on="route_id",
         how="left"
     )
+    .join(
+        events_by_load,
+        on="load_id",
+        how="left"
+    )
+    .withColumn("total_delivery_events", coalesce(col("total_delivery_events"), lit(0)))
+    .withColumn("on_time_events", coalesce(col("on_time_events"), lit(0)))
+    .withColumn("total_detention_minutes", coalesce(col("total_detention_minutes"), lit(0.0)))
     .select(
         "load_id",
         "customer_id",
@@ -116,7 +136,10 @@ load_performance = (
         "pieces",
         "revenue",
         "load_status",
-        "booking_type"
+        "booking_type",
+        "total_delivery_events",
+        "on_time_events",
+        "total_detention_minutes"
     )
 )
 
@@ -500,7 +523,7 @@ gold_table_keys = {
 
 print()
 print("=" * 70)
-print("GOLD VALIDATION & IDEMPOTENCY GRAIN CHECK")
+print("GOLD VALIDATION & IDEMPOTENCY / FAN-OUT GRAIN CHECK")
 print("=" * 70)
 
 for table_name, pk in gold_table_keys.items():
@@ -547,7 +570,7 @@ if abs(silver_total_rev - gold_load_rev) > 0.01 or abs(silver_total_rev - gold_c
     )
 
 print("-" * 70)
-print(f"RECONCILIATION PASS: Control Total Revenue = ${silver_total_rev:,.2f}")
+print(f"RECONCILIATION PASS: Control Total Revenue = ${silver_total_rev:,.2f} (Zero Fan-Out)")
 print("=" * 70)
 print("GOLD TRANSFORMATION PASSED")
 print("=" * 70)
