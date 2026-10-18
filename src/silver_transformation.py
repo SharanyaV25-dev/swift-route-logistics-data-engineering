@@ -3,7 +3,7 @@ import csv
 import shutil
 from pathlib import Path
 from datetime import datetime, timezone
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType, IntegerType, LongType, DoubleType
 
@@ -27,10 +27,51 @@ spark = (SparkSession.builder.appName('SwiftRoute-Silver-Transformation').master
          .config('spark.sql.legacy.timeParserPolicy','LEGACY').getOrCreate())
 spark.sparkContext.setLogLevel('WARN')
 
+
 def read_bronze(table):
-    files = list((BRONZE_DIR / table).glob('*.csv'))
-    if not files: raise FileNotFoundError(f'No Bronze CSV found for {table}: {BRONZE_DIR/table}')
-    return spark.read.option('header',True).option('inferSchema',False).option('mode','PERMISSIVE').csv(str(files[0]))
+    """
+    Read Bronze CSV inputs and explicitly detect valid-but-empty files
+    (distinguishing zero-row holiday/empty batches from silent extraction crashes).
+    """
+    files = sorted((BRONZE_DIR / table).glob('*.csv'))
+    if not files:
+        raise FileNotFoundError(f'No Bronze CSV found for {table}: {BRONZE_DIR/table}')
+    path_arg = str(files[0]) if len(files) == 1 else [str(f) for f in files]
+    df = (
+        spark.read
+        .option('header', True)
+        .option('inferSchema', False)
+        .option('mode', 'PERMISSIVE')
+        .csv(path_arg)
+    )
+    if df.limit(1).count() == 0:
+        print(f'[WARN] Empty Bronze input detected for {table}: valid header with 0 rows.')
+    return df
+
+
+def deduplicate_latest_state(df, pk_col, candidate_ts_cols=None):
+    """
+    Deduplicates records by primary key using a deterministic Window function
+    (ROW_NUMBER() OVER (PARTITION BY pk_col ORDER BY updated_at DESC, ...)).
+    Ensures late-arriving status corrections and updates always supersede prior states.
+    """
+    order_cols = []
+    if candidate_ts_cols:
+        for c in candidate_ts_cols:
+            if c in df.columns:
+                order_cols.append(F.col(c).desc_nulls_last())
+
+    for c in sorted(df.columns):
+        if c != pk_col and (not candidate_ts_cols or c not in candidate_ts_cols):
+            order_cols.append(F.col(c).desc_nulls_last())
+
+    window_spec = Window.partitionBy(pk_col).orderBy(*order_cols)
+    return (
+        df.withColumn('_rn', F.row_number().over(window_spec))
+        .filter(F.col('_rn') == 1)
+        .drop('_rn')
+    )
+
 
 def quarantine(df, table, reason):
     if df.limit(1).count() == 0: return
@@ -40,11 +81,13 @@ def quarantine(df, table, reason):
        .withColumn('quarantined_at_utc',F.lit(datetime.now(timezone.utc).isoformat()))
        .write.mode('overwrite').parquet(str(out)))
 
+
 def cast(df, mapping):
     for c,t in mapping.items(): df=df.withColumn(c,F.col(c).cast(t))
     return df
 
-print('\n'+'='*70+'\nSWIFTROUTE - SILVER TRANSFORMATION\n'+'='*70)
+
+print('\n'+'='*70+'\nSWIFTROUTE - SILVER TRANSFORMATION (LATE-STATE & CORRECTION AWARE)\n'+'='*70)
 bronze={t:read_bronze(t) for t in TABLES}
 for t,df in bronze.items(): print(f'Bronze loaded: {t:20s} {df.count():,} rows')
 
@@ -57,19 +100,31 @@ customers = cast(bronze["customers"], {"annual_revenue_potential": DoubleType()}
             .withColumn("customer_id", clean_id("customer_id")) \
             .withColumn("contract_start_date", F.to_date("contract_start_date"))
 quarantine(customers.filter(F.col("customer_id").isNull()), "customers", "missing_primary_key")
-customers = deduplicate_deterministic(customers.filter(F.col("customer_id").isNotNull()), "customer_id")
+customers = deduplicate_latest_state(
+    customers.filter(F.col("customer_id").isNotNull()),
+    "customer_id",
+    candidate_ts_cols=["updated_at", "contract_start_date"]
+)
 
 # Facilities
 facilities = cast(bronze["facilities"], {"latitude": DoubleType(), "longitude": DoubleType()}) \
              .withColumn("facility_id", clean_id("facility_id"))
 quarantine(facilities.filter(F.col("facility_id").isNull()), "facilities", "missing_primary_key")
-facilities = deduplicate_deterministic(facilities.filter(F.col("facility_id").isNotNull()), "facility_id")
+facilities = deduplicate_latest_state(
+    facilities.filter(F.col("facility_id").isNotNull()),
+    "facility_id",
+    candidate_ts_cols=["updated_at"]
+)
 
 # Routes
 routes = cast(bronze["routes"], {"typical_distance_miles": DoubleType(), "base_rate_per_mile": DoubleType(), "fuel_surcharge_rate": DoubleType(), "typical_transit_days": DoubleType()}) \
          .withColumn("route_id", clean_id("route_id"))
 quarantine(routes.filter(F.col("route_id").isNull()), "routes", "missing_primary_key")
-routes = deduplicate_deterministic(routes.filter(F.col("route_id").isNotNull()), "route_id")
+routes = deduplicate_latest_state(
+    routes.filter(F.col("route_id").isNotNull()),
+    "route_id",
+    candidate_ts_cols=["updated_at"]
+)
 
 # Drivers
 drivers = cast(bronze["drivers"], {"years_experience": IntegerType()}) \
@@ -77,18 +132,26 @@ drivers = cast(bronze["drivers"], {"years_experience": IntegerType()}) \
           .withColumn("hire_date", F.to_date("hire_date")) \
           .withColumn("termination_date", F.to_date("termination_date"))
 quarantine(drivers.filter(F.col("driver_id").isNull()), "drivers", "missing_primary_key")
-drivers = deduplicate_deterministic(drivers.filter(F.col("driver_id").isNotNull()), "driver_id")
+drivers = deduplicate_latest_state(
+    drivers.filter(F.col("driver_id").isNotNull()),
+    "driver_id",
+    candidate_ts_cols=["updated_at", "termination_date", "hire_date"]
+)
 
 # Trucks
 trucks = cast(bronze["trucks"], {"model_year": IntegerType(), "acquisition_mileage": LongType(), "tank_capacity_gallons": DoubleType()}) \
          .withColumn("truck_id", clean_id("truck_id")) \
          .withColumn("acquisition_date", F.to_date("acquisition_date"))
 quarantine(trucks.filter(F.col("truck_id").isNull()), "trucks", "missing_primary_key")
-trucks = deduplicate_deterministic(trucks.filter(F.col("truck_id").isNotNull()), "truck_id")
+trucks = deduplicate_latest_state(
+    trucks.filter(F.col("truck_id").isNotNull()),
+    "truck_id",
+    candidate_ts_cols=["updated_at", "acquisition_date"]
+)
 
 
 # ============================================================
-# FACT TABLES
+# FACT TABLES (WITH WINDOW DEDUPLICATION & CANCELLATION POLICY)
 # ============================================================
 
 # Loads
@@ -98,13 +161,24 @@ loads = cast(bronze["loads"], {"weight_lbs": DoubleType(), "pieces": IntegerType
     .withColumn("route_id", clean_id("route_id")) \
     .withColumn("load_date", F.to_date("load_date"))
 
+if "updated_at" in loads.columns:
+    loads = loads.withColumn("updated_at", F.to_timestamp("updated_at"))
+
 quarantine(loads.filter(F.col("load_id").isNull()), "loads", "missing_primary_key")
 loads = loads.filter(F.col("load_id").isNotNull())
 
 quarantine(get_invalid_loads(loads), "loads", "invalid_business_values")
 loads = get_valid_loads(loads)
 
-loads = deduplicate_deterministic(loads, "load_id")
+# Window deduplication: keep latest order state when updates/corrections repeat
+loads = deduplicate_latest_state(loads, "load_id", candidate_ts_cols=["updated_at", "load_date"])
+
+# Order Correction Policy: if latest valid load_status is CANCELLED, restate recognized revenue to 0.0
+if "load_status" in loads.columns and "revenue" in loads.columns:
+    loads = loads.withColumn(
+        "revenue",
+        F.when(F.upper(F.col("load_status")) == "CANCELLED", F.lit(0.0)).otherwise(F.col("revenue"))
+    )
 
 for fk_col, parent_df, reason in [("customer_id", customers, "invalid_customer_fk"), ("route_id", routes, "invalid_route_fk")]:
     quarantine(get_orphans(loads, fk_col, parent_df, fk_col), "loads", reason)
@@ -114,13 +188,16 @@ for fk_col, parent_df, reason in [("customer_id", customers, "invalid_customer_f
 trips = cast(bronze["trips"], {"actual_distance_miles": DoubleType(), "actual_duration_hours": DoubleType(), "fuel_gallons_used": DoubleType(), "idle_time_hours": DoubleType()}) \
     .withColumn("trip_id", clean_id("trip_id")).withColumn("load_id", clean_id("load_id")).withColumn("driver_id", clean_id("driver_id")).withColumn("truck_id", clean_id("truck_id")).withColumn("dispatch_date", F.to_date("dispatch_date"))
 
+if "updated_at" in trips.columns:
+    trips = trips.withColumn("updated_at", F.to_timestamp("updated_at"))
+
 quarantine(trips.filter(F.col("trip_id").isNull()), "trips", "missing_primary_key")
 trips = trips.filter(F.col("trip_id").isNotNull())
 
 quarantine(get_invalid_trips(trips), "trips", "invalid_duration_metrics")
 trips = get_valid_trips(trips)
 
-trips = deduplicate_deterministic(trips, "trip_id")
+trips = deduplicate_latest_state(trips, "trip_id", candidate_ts_cols=["updated_at", "dispatch_date"])
 
 for fk_col, parent_df, reason in [("load_id", loads, "invalid_load_fk"), ("driver_id", drivers, "invalid_driver_fk"), ("truck_id", trucks, "invalid_truck_fk")]:
     quarantine(get_orphans(trips, fk_col, parent_df, fk_col), "trips", reason)
@@ -130,13 +207,21 @@ for fk_col, parent_df, reason in [("load_id", loads, "invalid_load_fk"), ("drive
 events = cast(bronze["delivery_events"], {"detention_minutes": IntegerType(), "on_time_flag": BooleanType()}) \
     .withColumn("event_id", clean_id("event_id")).withColumn("load_id", clean_id("load_id")).withColumn("trip_id", clean_id("trip_id")).withColumn("facility_id", clean_id("facility_id")).withColumn("scheduled_datetime", F.to_timestamp("scheduled_datetime")).withColumn("actual_datetime", F.to_timestamp("actual_datetime"))
 
+if "updated_at" in events.columns:
+    events = events.withColumn("updated_at", F.to_timestamp("updated_at"))
+
 quarantine(events.filter(F.col("event_id").isNull()), "delivery_events", "missing_primary_key")
 events = events.filter(F.col("event_id").isNotNull())
 
 quarantine(get_invalid_events(events), "delivery_events", "invalid_event_timestamps")
 events = get_valid_events(events)
 
-events = deduplicate_deterministic(events, "event_id")
+# Window deduplication: keep latest event telemetry when late corrections arrive
+events = deduplicate_latest_state(
+    events,
+    "event_id",
+    candidate_ts_cols=["updated_at", "actual_datetime", "scheduled_datetime"]
+)
 
 for fk_col, parent_df, reason in [("load_id", loads, "orphan_load_fk"), ("trip_id", trips, "orphan_trip_fk"), ("facility_id", facilities, "invalid_facility_fk")]:
     quarantine(get_orphans(events, fk_col, parent_df, fk_col), "delivery_events", reason)
