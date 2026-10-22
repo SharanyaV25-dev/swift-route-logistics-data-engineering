@@ -1,22 +1,31 @@
 # SwiftRoute Logistics: Cloud Lakehouse & Automated Data Pipeline
 
-[CI/CD Pipeline](https://www.google.com/search?q=https%3A%2F%2Fgithub.com%2FSharanyaV25-dev%2Fswift-route-logistics-data-engineering%2Factions)
+[![CI/CD Pipeline](https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering/actions/workflows/ci_cd_pipeline.yml/badge.svg)](https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering/actions)
+![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
+![PySpark](https://img.shields.io/badge/PySpark-AWS%20Glue-orange.svg)
+![Apache Iceberg](https://img.shields.io/badge/Lakehouse-Apache%20Iceberg%20v2-teal.svg)
+![Apache Airflow](https://img.shields.io/badge/Orchestration-Apache%20Airflow%202.10-017CEE.svg)
 
+An enterprise-grade cloud data engineering pipeline simulating a high-throughput logistics and fleet management platform (**350,000+ records across 8 operational tables**). The lakehouse implements a **Medallion Architecture** using **AWS Glue (PySpark)** and **Apache Iceberg**, orchestrated via **Dockerized Apache Airflow**, protected by **6 automated defensive engineering & financial reconciliation tests**, and continuously deployed through **GitHub Actions**.
 
+---
 
+## Business Problem & Key Analytical Questions Answered
 
+In logistics and supply chain networks, shipment and tracking telemetry arrives fragmented across multiple disparate sources with frequent network retries, out-of-order delivery scans, late status corrections, and schema inconsistencies. 
 
-
-
-An enterprise-grade cloud data engineering pipeline simulating a high-throughput logistics and fleet management platform (350,000+ records across 8 operational tables). The lakehouse implements a **Medallion Architecture** using **AWS Glue (PySpark)** and **Apache Iceberg**, orchestrated via **Apache Airflow**, protected by **automated defensive engineering & reconciliation tests**, and continuously deployed through **GitHub Actions**.
+SwiftRoute ingests, validates, and models raw logistics feeds into ACID-compliant **Apache Iceberg Gold Marts** queried via **Amazon Athena** to answer critical operational KPIs:
+1. **Revenue & Financial Integrity:** What is the exact recognized freight revenue per customer and load after accounting for late order cancellations and multi-leg transit fan-outs?
+2. **Carrier & Route SLA Performance:** Which origin-to-destination routes fall below on-time delivery SLAs or exhibit degraded fuel efficiency (MPG)?
+3. **Facility Detention Bottlenecks:** Which warehouse facilities generate the highest truck detention times (in minutes), including late-arriving facility scan telemetry?
 
 ---
 
 ## Architecture Overview
 
+![SwiftRoute System Architecture](assets/pipeline_architecture.png)
 
-
-```
+```text
                       ┌────────────────────────┐
                       │  Raw Logistics Data    │
                       │  (Batch CSV Streams)   │
@@ -63,18 +72,19 @@ Rather than assuming happy-path execution, this pipeline is verified against **s
 
 | # | Failure Scenario | How We Break It | Engineering Defense & Pass Condition | Evidence Log |
 | :- | :--- | :--- | :--- | :--- |
-| **1** | **Duplicate Delivery** | Deliver the exact same 100-load batch file twice (simulating upstream network retry). | Gold Iceberg `MERGE INTO` upsert & primary-key grain deduplication preserve exact row count (`100`) and revenue (`$50,250.00`). | `run_logs/test_duplicate_delivery.log` |
-| **2** | **Child-Table Fan-Out** | Join 50 parent `loads` (`$50,000` revenue) with 250 child `delivery_events` (5 events/load). | Naive join inflates revenue 5.0x (`$250,000`). Pre-aggregating `delivery_events` by `load_id` before joining preserves `50` rows and `$50,000.00` revenue. | `run_logs/test_child_table_fanout.log` |
-| **3** | **Order / Load Correction** | Update a prior `COMPLETED` load (`LD00003`, `$1,800`) to `CANCELLED` in a subsequent batch. | Silver recency window (`ROW_NUMBER() OVER (PARTITION BY load_id ORDER BY updated_at DESC)`) selects latest state and restates cancelled revenue to `$0.00`. | `run_logs/test_late_corrections_and_restatement.log` |
-| **4** | **Late-Arriving Event** | Deliver a facility scan (`EVT003`, 90m detention) 7 days after its business `event_date`. | Pipeline partitions by **event time** (`event_date`) rather than processing time, accurately restating `2026-10-01` SLA rate (`66.67%`) and avg detention (`40.0m`). | `run_logs/test_late_corrections_and_restatement.log` |
-| **5** | **Task Failure & Retry** | Deliberately fail the Silver validation gate in the Airflow DAG, then fix and retry twice. | `TriggerRule.ALL_SUCCESS` blocks `gold_etl` on failure (`UPSTREAM_FAILED`). Subsequent retries complete with zero duplicate rows or double-counted revenue. | `run_logs/test_failure_recovery_and_empty_input.log` |
-| **6** | **Empty Input Batch** | Deliver a valid header-only (0-row) CSV vs. a malformed CSV missing required columns. | Distinguishes valid holiday empty batches (`EMPTY_VALID_BATCH` warning) from `SCHEMA_CORRUPTION` errors without overwriting downstream marts. | `run_logs/test_failure_recovery_and_empty_input.log` |
+| **1** | **Duplicate Delivery** | Deliver the exact same 100-load batch file twice (simulating upstream network retry). | Gold Iceberg `MERGE INTO` upsert & primary-key grain deduplication preserve exact row count (`100`) and revenue (`$50,250.00`). | [`run_logs/test_duplicate_delivery.log`](run_logs/test_duplicate_delivery.log) |
+| **2** | **Child-Table Fan-Out** | Join 50 parent `loads` (`$50,000` revenue) with 250 child `delivery_events` (5 events/load). | Naive join inflates revenue 5.0x (`$250,000`). Pre-aggregating `delivery_events` by `load_id` before joining preserves `50` rows and `$50,000.00` revenue. | [`run_logs/test_child_table_fanout.log`](run_logs/test_child_table_fanout.log) |
+| **3** | **Order / Load Correction** | Update a prior `COMPLETED` load (`LD00003`, `$1,800`) to `CANCELLED` in a subsequent batch. | Silver recency window (`ROW_NUMBER() OVER (PARTITION BY load_id ORDER BY updated_at DESC)`) selects latest state and restates cancelled revenue to `$0.00`. | [`run_logs/test_late_corrections_and_restatement.log`](run_logs/test_late_corrections_and_restatement.log) |
+| **4** | **Late-Arriving Event** | Deliver a facility scan (`EVT003`, 90m detention) 7 days after its business `event_date`. | Pipeline partitions by **event time** (`event_date`) rather than processing time, accurately restating `2026-10-01` SLA rate (`66.67%`) and avg detention (`40.0m`). | [`run_logs/test_late_corrections_and_restatement.log`](run_logs/test_late_corrections_and_restatement.log) |
+| **5** | **Task Failure & Retry** | Deliberately fail the Silver validation gate in the Airflow DAG, then fix and retry twice. | `TriggerRule.ALL_SUCCESS` blocks `gold_etl` on failure (`UPSTREAM_FAILED`). Subsequent retries complete with zero duplicate rows or double-counted revenue. | [`run_logs/test_failure_recovery_and_empty_input.log`](run_logs/test_failure_recovery_and_empty_input.log) |
+| **6** | **Empty Input Batch** | Deliver a valid header-only (0-row) CSV vs. a malformed CSV missing required columns. | Distinguishes valid holiday empty batches (`EMPTY_VALID_BATCH` warning) from `SCHEMA_CORRUPTION` errors without overwriting downstream marts. | [`run_logs/test_failure_recovery_and_empty_input.log`](run_logs/test_failure_recovery_and_empty_input.log) |
 
 ### Production Incident Recovery Note (Sample Post-Mortem)
 * **Incident:** Upstream carrier feed re-transmitted `loads` batch `2026-10-15` while simultaneously delivering 5-day-late detention events.
 * **Observable Impact:** Unprotected joins between `loads` and `delivery_events` multiplied load revenue 5.0x in exploratory queries.
 * **Root Cause:** 1-to-Many cardinality between `loads` (`load_id` grain) and `delivery_events` (`event_id` grain) combined with append-only ingestion.
-* **Fix & Prevention:** Enforced `events_by_load` pre-aggregation at the `load_id` grain prior to joining, implemented Iceberg `MERGE INTO` upserts on primary keys, and added an automated post-transform reconciliation check asserting `SUM(silver.loads.revenue) == SUM(gold_load_performance.revenue) == SUM(gold_customer_performance.total_revenue)`.
+* **Fix & Prevention:** Enforced `events_by_load` pre-aggregation at the `load_id` grain prior to joining, implemented Iceberg `MERGE INTO` upserts on primary keys, and added an automated post-transform reconciliation check asserting:
+  `SUM(silver.loads.revenue) == SUM(gold_load_performance.revenue) == SUM(gold_customer_performance.total_revenue)`
 
 ---
 
@@ -88,6 +98,14 @@ Rather than assuming happy-path execution, this pipeline is verified against **s
 | `gold_load_performance` | Gold | One shipment with pre-aggregated SLA metrics | `load_id` | Enforces 1:1 `load_id` uniqueness and 100% revenue control-total parity with Silver `loads` |
 | `gold_customer_performance` | Gold | One customer account summary | `customer_id` | Reconciled against Silver `loads` total revenue (`abs(diff) < $0.01`) |
 | `gold_daily_operations` | Gold | One calendar business date (`event_date`) | `event_date` | Restated by event time when late telemetry arrives |
+
+---
+
+## Key Architectural Decisions & Trade-Offs
+
+* **Why Apache Iceberg v2 over Standard Hive-Style Parquet?** Logistics shipment statuses frequently mutate (`IN_TRANSIT` → `COMPLETED` or `CANCELLED`) and late facility scans arrive days after initial ingestion. Standard S3 Parquet requires expensive full-partition overwrites to update existing records. Apache Iceberg v2 provides row-level ACID `MERGE INTO` upserts, snapshot isolation, schema evolution, and time-travel auditability without partition write amplification.
+* **Why Scheduled Micro-Batch PySpark over Real-Time Streaming (Kafka/Flink)?** At a daily volume of ~350K records across operational tables, scheduled AWS Glue PySpark batch jobs orchestrated by Airflow satisfy operational SLA reporting windows at a fraction of the infrastructure cost and operational overhead of a 24/7 streaming cluster.
+* **Quarantine Pattern vs. Hard Fail on Row Corruption:** Rather than failing an entire batch when 1% of carrier records contain negative weights or orphaned foreign keys, the Silver quality engine routes malformed rows to partitioned S3 Quarantine prefixes (`s3://.../quarantine/`) for audit inspection while allowing valid records to proceed to Gold marts with 100% control-total reconciliation.
 
 ---
 
@@ -106,7 +124,7 @@ Rather than assuming happy-path execution, this pipeline is verified against **s
 
 ## Repository Structure
 
-```
+```text
 swift-route-logistics-data-engineering/
 ├── .github/
 │   └── workflows/
@@ -192,7 +210,7 @@ LIMIT 10;
 ### 1. Clone & Configure Environment
 
 ```bash
-git clone https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering.git
+git clone [https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering.git](https://github.com/SharanyaV25-dev/swift-route-logistics-data-engineering.git)
 cd swift-route-logistics-data-engineering
 
 python -m venv venv
